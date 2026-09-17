@@ -1,11 +1,12 @@
 """
-bruno_coin.py — Versão P2P Pura (Sem Servidor Central)
-========================================================
-✅ Nenhum servidor central necessário
+bruno_coin.py — Versão P2P Pura + GUI Nativa
+=========================================================
+✅ Sem servidor central
+✅ Sem navegador / sem pywebview
+✅ Interface gráfica nativa Tkinter
 ✅ Conexões diretas entre os nós
 ✅ Descoberta automática na rede local
-✅ Conexão via IP público entre redes diferentes
-✅ Cada nó conhece e se conecta a vários outros nós
+✅ Conexão via IP público entre estados diferentes
 """
 
 import hashlib
@@ -16,8 +17,6 @@ import socket
 import threading
 import sys
 import re
-
-import webview
 
 from cripto_wallet import WalletManager
 from cripto_db import BlockchainDB
@@ -30,7 +29,7 @@ from cripto_p2p_network import AutoNodeDiscovery
 
 COIN_NAME = "Bruno"
 COIN_SYMBOL = "BRN"
-VERSION = "3.0-p2p"
+VERSION = "3.1-P2P-NATIVE"
 
 BLOCK_REWARD = 1.0
 
@@ -48,18 +47,13 @@ MONERO_FORK_NETWORK_ID = [
 
 # ----------------------------------------------------------------
 # 📌 LISTA DE NÓS CONHECIDOS (SEED NODES)
-# Você e seus amigos trocam IPs e portas entre si
-# Adicione aqui os IPs públicos dos outros computadores
-# Formato: ("IP", PORTA)
-# Exemplo: [("200.10.20.30", 6001), ("187.20.30.40", 6001)]
-# Deixe VAZIO se só usar rede local
+# Troquem os IPs entre vocês
 # ----------------------------------------------------------------
 SEED_NODES = [
     # ("IP_DO_AMIGO", 6001),   # ← adicione os IPs dos outros aqui
 ]
 
-# Tempo entre tentativas de reconectar a nós conhecidos
-SEED_RECONNECT_INTERVAL = 60  # segundos
+SEED_RECONNECT_INTERVAL = 60
 
 
 # ============================================================
@@ -137,40 +131,33 @@ class CriptoAPI:
         self.db_path = f"brn_node_{self.p2p_port}.db"
         self.db = BlockchainDB(self.db_path)
 
-        # Mempool e peers
         self.mempool = []
         self.mempool_lock = threading.Lock()
 
-        # Conjunto de peers conectados: (ip, porta)
         self.connected_peers = set()
         self.peers_lock = threading.Lock()
 
-        # Lista de todos os nós conhecidos (conectados + descobertos + seeds)
-        self.known_peers = set()  # formato "ip:porta"
+        self.known_peers = set()
 
-        # Mineração
         self.is_mining = False
         self.mining_stop_event = threading.Event()
         self.miner_thread = None
 
-        # Descoberta LAN automática
         self.discovery = AutoNodeDiscovery(p2p_port=self.p2p_port)
 
-        # Inicialização
         self._init_database()
         self._load_seed_nodes()
 
-        # Inicia threads
         self.server_running = True
         threading.Thread(target=self._start_p2p_server, daemon=True).start()
         threading.Thread(target=self._start_discovery_service, daemon=True).start()
         threading.Thread(target=self._peer_maintenance_loop, daemon=True).start()
-        threading.Thread(target=self._cleanup_disconnected_peers, daemon=True).start()
 
         print(f"\n{'='*60}")
         print(f"  {COIN_NAME} Coin v{VERSION}")
         print(f"  Nó iniciado na porta {self.p2p_port}")
         print(f"  Modo: P2P Pura — Sem Servidor Central")
+        print(f"  Interface: Tkinter (Nativa)")
         print(f"{'='*60}\n")
 
     # ========================================================
@@ -178,7 +165,6 @@ class CriptoAPI:
     # ========================================================
 
     def _load_seed_nodes(self):
-        """Carrega os nós conhecidos da lista SEED_NODES"""
         for ip, port in SEED_NODES:
             if port != self.p2p_port or not self._is_local_ip(ip):
                 self.known_peers.add(f"{ip}:{port}")
@@ -186,12 +172,10 @@ class CriptoAPI:
             print(f"🌐 {len(SEED_NODES)} nó(s) conhecido(s) carregado(s)")
 
     def _is_local_ip(self, ip: str) -> bool:
-        """Verifica se o IP é deste próprio computador"""
-        local_ips = ["127.0.0.1", "localhost", self.discovery.local_ip]
+        local_ips = ["127.0.0.1", "localhost", getattr(self.discovery, 'local_ip', '127.0.0.1')]
         return ip in local_ips
 
     def _parse_peer_str(self, peer_str: str) -> tuple:
-        """Converte 'ip:porta' para (ip, porta)"""
         try:
             ip, port = peer_str.rsplit(":", 1)
             return ip, int(port)
@@ -199,7 +183,7 @@ class CriptoAPI:
             return None, None
 
     # ========================================================
-    # DESCOBERTA E MANUTENÇÃO DE PEERS
+    # DESCOBERTA E MANUTENÇÃO
     # ========================================================
 
     def _start_discovery_service(self):
@@ -207,52 +191,30 @@ class CriptoAPI:
         self.discovery.run()
 
     def _peer_maintenance_loop(self):
-        """
-        Coração da rede P2P:
-        - Descobre novos nós na LAN
-        - Reconecta a nós conhecidos quando desconectado
-        - Adiciona nós descobertos à lista de conhecidos
-        """
         time.sleep(3)
-
         while self.server_running:
             try:
-                # 1. Adiciona nós descobertos na LAN à lista de conhecidos
                 discovered = self.discovery.get_discovered_peers()
                 for peer_str in discovered:
                     if peer_str not in self.known_peers:
                         self.known_peers.add(peer_str)
                         print(f"✨ Novo nó descoberto na rede local: {peer_str}")
 
-                # 2. Tenta conectar a nós conhecidos que estão desconectados
                 for peer_str in list(self.known_peers):
                     ip, port = self._parse_peer_str(peer_str)
                     if not ip or not port:
                         continue
-
                     with self.peers_lock:
                         if (ip, port) in self.connected_peers:
-                            continue  # já está conectado
-
-                    # Tenta conectar
+                            continue
                     result = self.connect_and_sync(ip, port)
                     if result["status"] == "sucesso":
                         with self.peers_lock:
                             self.connected_peers.add((ip, port))
                         print(f"🔗 Conectado a {ip}:{port}")
-
             except Exception as e:
                 print(f"⚠️ Erro na manutenção de peers: {e}")
-
             time.sleep(SEED_RECONNECT_INTERVAL)
-
-    def _cleanup_disconnected_peers(self):
-        """Remove peers que não respondem mais"""
-        while self.server_running:
-            time.sleep(30)
-            # Aqui você poderia implementar um PING real
-            # Por enquanto mantemos a lista como está
-            pass
 
     # ========================================================
     # BANCO DE DADOS
@@ -355,7 +317,7 @@ class CriptoAPI:
         return balance
 
     # ========================================================
-    # SERVIDOR P2P — RECEBE CONEXÕES DE OUTROS NÓS
+    # SERVIDOR P2P
     # ========================================================
 
     def _receive_all(self, sock, buffer_size=4096, max_size=10*1024*1024):
@@ -385,8 +347,6 @@ class CriptoAPI:
             try:
                 conn, addr = server.accept()
                 ip, port = addr
-
-                # Adiciona à lista de conhecidos e conectados
                 peer_str = f"{ip}:{port}"
                 if not self._is_local_ip(ip):
                     with self.peers_lock:
@@ -394,67 +354,46 @@ class CriptoAPI:
                         self.connected_peers.add((ip, port))
                     print(f"🔌 Conexão recebida de {ip}:{port}")
 
-                # Processa mensagem
                 data = self._receive_all(conn)
                 self._process_message(data, ip, port)
                 conn.close()
-
             except socket.timeout:
                 continue
             except Exception as e:
                 if self.server_running:
                     print(f"⚠️ Erro servidor: {e}")
-
         server.close()
 
     def _process_message(self, data: str, sender_ip: str, sender_port: int):
-        """Processa mensagens recebidas de outros nós"""
         if not data:
             return
-
         try:
             if data == "GET_HEIGHT":
                 chain = self.db.get_raw_chain()
                 self._send_to_peer(sender_ip, sender_port, str(len(chain)))
-
             elif data == "GET_CHAIN":
                 chain = self.db.get_raw_chain()
                 self._send_to_peer(sender_ip, sender_port, json.dumps(chain))
-
             elif data.startswith("BROADCAST_TX:"):
                 tx = json.loads(data.split(":", 1)[1])
                 if self._verify_tx_structure(tx):
                     with self.mempool_lock:
                         if tx not in self.mempool:
                             self.mempool.append(tx)
-                            print(f"📥 Transação recebida de {sender_ip}:{sender_port}")
-                    # Repassa a transação para todos os outros nós (propagação)
                     self._propagate_transaction(tx, exclude=(sender_ip, sender_port))
-
             elif data.startswith("NEW_BLOCK:"):
                 block_data = json.loads(data.split(":", 1)[1])
                 ok, msg = self._validate_block(block_data)
                 if ok:
-                    # Verifica se já temos este bloco
                     chain = self.db.get_raw_chain()
                     if not any(b["hash"] == block_data["hash"] for b in chain):
                         self.db.insert_block(BrunoBlock(**block_data))
                         print(f"📦 Novo bloco recebido de {sender_ip}:{sender_port} — #{block_data['index']}")
-                        # Repassa o bloco para todos os outros nós
                         self._propagate_block(block_data, exclude=(sender_ip, sender_port))
-                else:
-                    print(f"⚠️ Bloco de {sender_ip}:{sender_port} rejeitado: {msg}")
-
-            elif data.startswith("SYNC_CHAIN:"):
-                remote_chain = json.loads(data.split(":", 1)[1])
-                result = self._resolve_consensus(remote_chain)
-                print(f"🔄 Sincronização com {sender_ip}:{sender_port}: {result}")
-
         except Exception as e:
-            print(f"⚠️ Erro ao processar mensagem de {sender_ip}:{sender_port}: {e}")
+            print(f"⚠️ Erro ao processar mensagem: {e}")
 
     def _send_to_peer(self, ip: str, port: int, message: str):
-        """Envia uma mensagem para um peer específico"""
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(5.0)
@@ -468,7 +407,6 @@ class CriptoAPI:
             return False
 
     def _propagate_transaction(self, tx, exclude=None):
-        """Envia uma transação para todos os nós conectados, exceto o remetente"""
         exclude = exclude or (None, None)
         msg = f"BROADCAST_TX:{json.dumps(tx)}"
         count = 0
@@ -481,7 +419,6 @@ class CriptoAPI:
             print(f"📤 Transação propagada para {count} nó(s)")
 
     def _propagate_block(self, block_dict, exclude=None):
-        """Envia um novo bloco para todos os nós conectados, exceto o remetente"""
         exclude = exclude or (None, None)
         msg = f"NEW_BLOCK:{json.dumps(block_dict)}"
         count = 0
@@ -494,13 +431,11 @@ class CriptoAPI:
             print(f"📤 Bloco #{block_dict['index']} propagado para {count} nó(s)")
 
     # ========================================================
-    # CONEXÃO COM OUTROS NÓS
+    # CONEXÃO E SINCRONIZAÇÃO
     # ========================================================
 
     def connect_and_sync(self, ip: str, port: int) -> dict:
-        """Conecta a um nó e sincroniza a blockchain"""
         try:
-            # Pede altura da chain
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(5.0)
             s.connect((ip, port))
@@ -514,7 +449,6 @@ class CriptoAPI:
             if remote_height <= local_height:
                 return {"status": "sucesso", "message": "Já está atualizado"}
 
-            # Pede a chain completa
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(15.0)
             s.connect((ip, port))
@@ -528,7 +462,6 @@ class CriptoAPI:
 
             result = self._resolve_consensus(remote_chain)
             return {"status": "sucesso", "message": result}
-
         except Exception as e:
             with self.peers_lock:
                 self.connected_peers.discard((ip, port))
@@ -641,7 +574,7 @@ class CriptoAPI:
 
         for i in range(1, len(remote_chain)):
             if remote_chain[i]["previous_hash"] != remote_chain[i-1]["hash"]:
-                return "Cadeia remota corrompida — hashes não encadeiam"
+                return "Cadeia remota corrompida"
 
         for block in remote_chain:
             ok, msg = self._validate_block(block)
@@ -653,7 +586,7 @@ class CriptoAPI:
         return f"Sincronizado com sucesso: {len(remote_chain)} blocos"
 
     # ========================================================
-    # INTERFACE PÚBLICA
+    # INTERFACE PÚBLICA — Métodos chamados pela GUI
     # ========================================================
 
     def get_full_chain(self):
@@ -674,16 +607,17 @@ class CriptoAPI:
         }
 
     def get_network_status(self):
+        local_endpoint = getattr(self.discovery, 'get_local_endpoint', lambda: f"---:{self.p2p_port}")()
+        discovered_lan = getattr(self.discovery, 'get_discovered_peers', lambda: [])()
         return {
             "connected_peers": [f"{i}:{p}" for i, p in self.connected_peers],
             "known_peers": sorted(self.known_peers),
-            "discovered_lan": self.discovery.get_discovered_peers(),
-            "local_endpoint": self.discovery.get_local_endpoint(),
+            "discovered_lan": discovered_lan,
+            "local_endpoint": local_endpoint,
             "is_mining": self.is_mining
         }
 
     def add_peer_manually(self, ip: str, port: int):
-        """Adiciona um nó conhecido manualmente pela interface"""
         try:
             port = int(port)
             if not (1 <= port <= 65535):
@@ -691,7 +625,6 @@ class CriptoAPI:
             peer_str = f"{ip}:{port}"
             self.known_peers.add(peer_str)
             print(f"➕ Nó adicionado manualmente: {peer_str}")
-            # Tenta conectar imediatamente
             threading.Thread(target=self.connect_and_sync, args=(ip, port), daemon=True).start()
             return {"status": "sucesso", "message": f"Nó {ip}:{port} adicionado"}
         except Exception as e:
@@ -735,15 +668,10 @@ class CriptoAPI:
                 if tx not in self.mempool:
                     self.mempool.append(tx)
 
-            # Propaga para todos os nós conectados
             self._propagate_transaction(tx)
             return {"status": "sucesso", "message": "Transação enviada e propagada!"}
         except Exception as e:
             return {"status": "erro", "message": str(e)}
-
-    # ========================================================
-    # MINERAÇÃO
-    # ========================================================
 
     def toggle_mining(self, miner_address: str):
         if self.is_mining:
@@ -798,17 +726,15 @@ class CriptoAPI:
                     difficulty=next_diff
                 )
 
-                print(f"⛏️ Minerando bloco #{new_block.index} (dificuldade: {next_diff})...")
+                print(f"⛏️ Minerando bloco #{new_block.index} (dificuldade: {next_diff})…")
                 if new_block.mine_block(self.mining_stop_event):
                     block_dict = new_block.to_dict()
                     print(f"\n🎉 BLOCO MINERADO! #{new_block.index}")
-                    print(f"    Hash: {new_block.hash[:30]}...")
+                    print(f"    Hash: {new_block.hash[:30]}…")
                     print(f"    Recompensa: {BLOCK_REWARD} {COIN_SYMBOL}")
 
-                    # Salva localmente
                     self.db.insert_block(new_block)
 
-                    # Limpa transações mineradas da mempool
                     with self.mempool_lock:
                         mined_tx_hashes = set(
                             hashlib.sha256(json.dumps(t, sort_keys=True).encode()).hexdigest()
@@ -821,7 +747,6 @@ class CriptoAPI:
                             not in mined_tx_hashes
                         ]
 
-                    # ✅ Propaga o bloco para TODOS os outros nós conectados
                     self._propagate_block(block_dict)
 
             except Exception as e:
@@ -832,7 +757,7 @@ class CriptoAPI:
 
 
 # ============================================================
-# INICIALIZAÇÃO
+# INICIALIZAÇÃO — COM GUI NATIVA
 # ============================================================
 
 if __name__ == "__main__":
@@ -845,16 +770,14 @@ if __name__ == "__main__":
 
     api = CriptoAPI(node_port=port)
 
-    webview.create_window(
-        title=f"{COIN_NAME} Coin v{VERSION} — Porta {port}",
-        url="index.html",
-        js_api=api,
-        width=900,
-        height=700,
-        resizable=True
-    )
-
-    webview.start()
+    # ✅ Usar GUI NATIVA Tkinter
+    try:
+        from bruno_gui import start_gui
+        start_gui(api)
+    except ImportError as e:
+        print(f"\n⚠️ Arquivo bruno_gui.py não encontrado: {e}")
+        print("💡 Crie o arquivo bruno_gui.py com o código da interface gráfica!")
+        input("\nPressione Enter para sair...")
 
     # Encerramento limpo
     api.server_running = False
