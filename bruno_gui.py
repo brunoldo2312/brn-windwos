@@ -1,459 +1,278 @@
 """
-bruno_gui.py — Interface Gráfica Nativa (Sem Navegador!)
+bruno_gui.py — Interface Gráfica Completa com Ponte BTC
 =========================================================
-✅ Usa Tkinter (nativo do Python — não precisa de navegador)
-✅ Conecta diretamente com a API do bruno_coin.py
-✅ Mesmas funcionalidades do HTML, mas em app de desktop
+✅ Carteira BRN
+✅ Mineração e transações
+✅ Rede P2P
+✅ 🆕 Ponte BTC — Depósito e Saque
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext, filedialog
+from tkinter import ttk, messagebox, scrolledtext
 import threading
 import time
-import json
 
 
 class BrunoGUI:
-    def __init__(self, api):
+    def __init__(self, api, bridge=None):
         self.api = api
-        self.wallet = {"address": "", "sk": "", "pk": ""}
-        self.mining = False
-        self.auto_refresh_running = True
+        self.bridge = bridge  # Ponte BTC opcional
         
-        # Janela principal
         self.root = tk.Tk()
-        self.root.title(f"🏦 BRN Coin v{self.api.__class__.__module__} — Porta {self.api.p2p_port}")
-        self.root.geometry("900x750")
-        self.root.minsize(800, 600)
+        self.root.title("Bruno Coin — Carteira & Ponte BTC")
+        self.root.geometry("900x650")
         
-        # Cores (tema escuro)
-        self.colors = {
-            "bg": "#0d1117",
-            "fg": "#e6edf3",
-            "card": "#161b22",
-            "border": "#30363d",
-            "accent": "#58a6ff",
-            "success": "#238636",
-            "warning": "#d29922",
-            "error": "#f85149",
-            "input_bg": "#0d1117"
-        }
-        
-        self._setup_style()
         self._build_ui()
-        self._start_auto_refresh()
-        
-        self.log("✅ Interface iniciada! Clique em 'Criar Nova Carteira' para começar.")
+        self._refresh_stats()
 
-    # ========================================================
-    # ESTILO
-    # ========================================================
-    def _setup_style(self):
-        self.root.configure(bg=self.colors["bg"])
-        self.style = ttk.Style(self.root)
-        self.style.theme_use("clam")
-        
-        # Configurar estilos
-        self.style.configure("TFrame", background=self.colors["card"])
-        self.style.configure("Card.TFrame", background=self.colors["card"], 
-                            borderwidth=1, relief="solid")
-        self.style.configure("TLabel", background=self.colors["card"], 
-                            foreground=self.colors["fg"], font=("Segoe UI", 10))
-        self.style.configure("Header.TLabel", foreground=self.colors["accent"], 
-                            font=("Segoe UI", 14, "bold"), background=self.colors["bg"])
-        self.style.configure("Section.TLabel", foreground=self.colors["accent"], 
-                            font=("Segoe UI", 11, "bold"), background=self.colors["card"])
-        self.style.configure("Status.TLabel", font=("Consolas", 9))
-        
-        self.style.configure("TButton", font=("Segoe UI", 9, "bold"), padding=5)
-        self.style.configure("Success.TButton", background=self.colors["success"], 
-                            foreground="white")
-        self.style.map("Success.TButton", background=[("active", "#2ea043")])
-        self.style.configure("Warning.TButton", background=self.colors["warning"], 
-                            foreground="black")
-        self.style.map("Warning.TButton", background=[("active", "#d29922")])
-        self.style.configure("Secondary.TButton", background="#21262d", 
-                            foreground=self.colors["fg"])
-        self.style.map("Secondary.TButton", background=[("active", "#30363d")])
-
-    # ========================================================
-    # CONSTRUIR INTERFACE
-    # ========================================================
     def _build_ui(self):
-        # Container principal com scroll
-        main_container = ttk.Frame(self.root)
-        main_container.pack(fill="both", expand=True, padx=15, pady=15)
+        """Constrói toda a interface"""
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # Título
-        ttk.Label(main_container, text="🏦 BRN Coin — Carteira P2P", 
-                 style="Header.TLabel").pack(anchor="w", pady=(0, 15))
+        # 📌 Aba 1 — Carteira
+        self.tab_wallet = ttk.Frame(notebook)
+        notebook.add(self.tab_wallet, text="  💰 Carteira  ")
+        self._build_wallet_tab()
         
-        # Canvas para rolagem
-        canvas = tk.Canvas(main_container, bg=self.colors["bg"], 
-                          highlightthickness=0)
-        scrollbar = ttk.Scrollbar(main_container, orient="vertical", command=canvas.yview)
-        self.scrollable_frame = ttk.Frame(canvas, style="TFrame")
+        # 📌 Aba 2 — Ponte BTC
+        self.tab_bridge = ttk.Frame(notebook)
+        notebook.add(self.tab_bridge, text="  ₿ Ponte BTC  ")
+        self._build_bridge_tab()
         
-        self.scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
+        # 📌 Aba 3 — Transações
+        self.tab_tx = ttk.Frame(notebook)
+        notebook.add(self.tab_tx, text="  📜 Transações  ")
+        self._build_tx_tab()
         
-        canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        # 📌 Aba 4 — Rede
+        self.tab_network = ttk.Frame(notebook)
+        notebook.add(self.tab_network, text="  🌐 Rede  ")
+        self._build_network_tab()
         
-        # Construir seções
-        self._build_p2p_section()
-        self._build_wallet_section()
-        self._build_balance_section()
-        self._build_backup_section()
-        self._build_send_section()
-        self._build_mining_section()
-        self._build_log_section()
+        # Rodapé
+        self.status_frame = ttk.Frame(self.root)
+        self.status_frame.pack(fill=tk.X, padx=5, pady=2)
+        self.status_label = ttk.Label(self.status_frame, text="Inicializado...")
+        self.status_label.pack(side=tk.LEFT)
 
-    def _build_section(self, title):
-        """Helper para criar seções com borda e título"""
-        frame = ttk.Frame(self.scrollable_frame, style="Card.TFrame", padding=15)
-        frame.pack(fill="x", padx=5, pady=(0, 12))
-        ttk.Label(frame, text=title, style="Section.TLabel").pack(anchor="w", pady=(0, 10))
-        return frame
-
-    def _build_p2p_section(self):
-        frame = self._build_section("🌐 Rede P2P")
-        
-        self.p2p_status = tk.Text(frame, height=5, wrap="word", 
-                                 bg="#010409", fg="#7ee787", 
-                                 font=("Consolas", 10), relief="flat", padx=10, pady=10)
-        self.p2p_status.pack(fill="x", pady=(0, 10))
-        self.p2p_status.insert("1.0", "Consultando rede…")
-        self.p2p_status.config(state="disabled")
-        
-        ttk.Button(frame, text="🔄 Atualizar Rede", 
-                  command=self.refresh_p2p).pack(anchor="w")
-
-    def _build_wallet_section(self):
-        frame = self._build_section("🔑 Carteira")
-        
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(fill="x", pady=(0, 10))
-        
-        self.gen_btn = ttk.Button(btn_frame, text="🎲 Criar Nova Carteira", 
-                                 command=self.generate_wallet, style="Success.TButton")
-        self.gen_btn.pack(side="left")
-        
-        self.api_status_label = ttk.Label(btn_frame, text="API: pronta ✓", 
-                                         style="Status.TLabel", foreground="#3fb950")
-        self.api_status_label.pack(side="left", padx=15)
+    # ========================================================
+    # ABA CARTEIRA
+    # ========================================================
+    
+    def _build_wallet_tab(self):
+        f = self.tab_wallet
         
         # Endereço
-        ttk.Label(frame, text="Endereço Público").pack(anchor="w", pady=(5, 2))
-        self.addr_entry = tk.Entry(frame, bg=self.colors["input_bg"], fg="#58a6ff", 
-                                  insertbackground="white", relief="solid", borderwidth=1)
-        self.addr_entry.pack(fill="x", pady=(0, 8))
-        self.addr_entry.insert(0, "Nenhuma carteira ativa")
-        self.addr_entry.config(state="readonly")
+        ttk.Label(f, text="Seu Endereço BRN:", font=("Arial", 10, "bold")).grid(row=0, column=0, sticky=tk.W, padx=10, pady=(15,5))
+        self.addr_var = tk.StringVar(value="brn1cd943fa71e1f91dcd62f52fc6138bc845ab")
+        addr_entry = ttk.Entry(f, textvariable=self.addr_var, width=55, font=("Courier", 10))
+        addr_entry.grid(row=1, column=0, columnspan=2, padx=10, sticky=tk.W)
         
-        # Chaves
-        row = ttk.Frame(frame)
-        row.pack(fill="x")
+        # Saldo BRN
+        ttk.Label(f, text="Saldo BRN:", font=("Arial", 10, "bold")).grid(row=2, column=0, sticky=tk.W, padx=10, pady=(20,5))
+        self.balance_var = tk.StringVar(value="0.00000000 BRN")
+        ttk.Label(f, textvariable=self.balance_var, font=("Arial", 16)).grid(row=3, column=0, sticky=tk.W, padx=10)
         
-        col1 = ttk.Frame(row)
-        col1.pack(side="left", fill="x", expand=True)
-        ttk.Label(col1, text="Chave Privada").pack(anchor="w", pady=(0, 2))
-        self.sk_entry = tk.Entry(col1, bg=self.colors["input_bg"], show="•", 
-                                relief="solid", borderwidth=1)
-        self.sk_entry.pack(fill="x", padx=(0, 5))
-        self.sk_entry.config(state="readonly")
+        # Saldo wBTC
+        ttk.Label(f, text="Saldo wBTC (Ponte):", font=("Arial", 10, "bold")).grid(row=4, column=0, sticky=tk.W, padx=10, pady=(20,5))
+        self.wbtc_var = tk.StringVar(value="0.00000000 wBTC")
+        ttk.Label(f, textvariable=self.wbtc_var, font=("Arial", 14), foreground="#f7931a").grid(row=5, column=0, sticky=tk.W, padx=10)
         
-        col2 = ttk.Frame(row)
-        col2.pack(side="right", fill="x", expand=True)
-        ttk.Label(col2, text="Chave Pública").pack(anchor="w", pady=(0, 2))
-        self.pk_entry = tk.Entry(col2, bg=self.colors["input_bg"], 
-                                relief="solid", borderwidth=1)
-        self.pk_entry.pack(fill="x", padx=(5, 0))
-        self.pk_entry.config(state="readonly")
-
-    def _build_balance_section(self):
-        frame = self._build_section("📊 Saldo")
+        # Enviar BRN
+        ttk.Separator(f, orient=tk.HORIZONTAL).grid(row=6, column=0, columnspan=2, sticky=tk.EW, padx=10, pady=20)
+        ttk.Label(f, text="Enviar BRN:", font=("Arial", 11, "bold")).grid(row=7, column=0, columnspan=2, sticky=tk.W, padx=10)
         
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(f, text="Destinatário:").grid(row=8, column=0, sticky=tk.W, padx=10, pady=5)
+        self.to_addr_var = tk.StringVar()
+        ttk.Entry(f, textvariable=self.to_addr_var, width=55).grid(row=9, column=0, columnspan=2, padx=10, sticky=tk.W)
         
-        ttk.Button(btn_frame, text="🔄 Atualizar Saldo", 
-                  command=self.check_balance, style="Secondary.TButton").pack(side="left")
+        ttk.Label(f, text="Valor:").grid(row=10, column=0, sticky=tk.W, padx=10, pady=5)
+        self.send_amount_var = tk.StringVar()
+        ttk.Entry(f, textvariable=self.send_amount_var, width=30).grid(row=11, column=0, sticky=tk.W, padx=10)
         
-        self.balance_box = tk.Text(frame, height=4, wrap="word", 
-                                  bg="#1f6feb1a", fg="#58a6ff", 
-                                  font=("Consolas", 12, "bold"), relief="flat", padx=12, pady=12)
-        self.balance_box.pack(fill="x")
-        self.balance_box.insert("1.0", "Nenhuma carteira ativa.")
-        self.balance_box.config(state="disabled")
-
-    def _build_backup_section(self):
-        frame = self._build_section("💾 Backup")
-        
-        row = ttk.Frame(frame)
-        row.pack(fill="x", pady=(0, 10))
-        
-        col1 = ttk.Frame(row)
-        col1.pack(side="left", fill="x", expand=True)
-        ttk.Label(col1, text="Nome do Arquivo").pack(anchor="w", pady=(0, 2))
-        self.filename_entry = tk.Entry(col1, bg=self.colors["input_bg"], relief="solid")
-        self.filename_entry.insert(0, "carteira_brn")
-        self.filename_entry.pack(fill="x", padx=(0, 5))
-        
-        col2 = ttk.Frame(row)
-        col2.pack(side="right", fill="x", expand=True)
-        ttk.Label(col2, text="Senha").pack(anchor="w", pady=(0, 2))
-        self.password_entry = tk.Entry(col2, bg=self.colors["input_bg"], show="•", 
-                                      relief="solid")
-        self.password_entry.pack(fill="x", padx=(5, 0))
-        
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(fill="x")
-        ttk.Button(btn_frame, text="💾 Salvar Backup", 
-                  command=self.export_wallet, style="Success.TButton").pack(side="left")
-        ttk.Button(btn_frame, text="📂 Carregar Backup", 
-                  command=self.import_wallet, style="Secondary.TButton").pack(side="left", padx=5)
-
-    def _build_send_section(self):
-        frame = self._build_section("💸 Enviar BRN")
-        
-        row1 = ttk.Frame(frame)
-        row1.pack(fill="x", pady=(0, 8))
-        
-        col1 = ttk.Frame(row1)
-        col1.pack(side="left", fill="x", expand=True)
-        ttk.Label(col1, text="Ativo").pack(anchor="w", pady=(0, 2))
-        self.asset_entry = tk.Entry(col1, bg=self.colors["input_bg"], relief="solid")
-        self.asset_entry.insert(0, "BRN")
-        self.asset_entry.config(state="readonly")
-        self.asset_entry.pack(fill="x", padx=(0, 5))
-        
-        col2 = ttk.Frame(row1)
-        col2.pack(side="right", fill="x", expand=True)
-        ttk.Label(col2, text="Quantidade").pack(anchor="w", pady=(0, 2))
-        self.amount_entry = tk.Entry(col2, bg=self.colors["input_bg"], relief="solid")
-        self.amount_entry.pack(fill="x", padx=(5, 0))
-        
-        ttk.Label(frame, text="Destinatário (brn1...)").pack(anchor="w", pady=(5, 2))
-        self.to_entry = tk.Entry(frame, bg=self.colors["input_bg"], relief="solid")
-        self.to_entry.pack(fill="x", pady=(0, 10))
-        
-        ttk.Button(frame, text="✉️ Assinar e Enviar", 
-                  command=self.send_transaction, style="Warning.TButton").pack(anchor="w")
-
-    def _build_mining_section(self):
-        frame = self._build_section("⛏️ Mineração")
-        
-        row = ttk.Frame(frame)
-        row.pack(fill="x")
-        
-        self.mining_btn = ttk.Button(row, text="▶ Iniciar Mineração", 
-                                    command=self.toggle_mining, style="Success.TButton")
-        self.mining_btn.pack(side="left")
-        
-        self.mining_status = ttk.Label(row, text="Parada", style="Status.TLabel", 
-                                      foreground="#f85149")
-        self.mining_status.pack(side="left", padx=15)
-        
-        ttk.Label(frame, text="Recompensa: 1.0 BRN por bloco", 
-                 font=("Segoe UI", 9), foreground="#8b949e").pack(anchor="w", pady=(8, 0))
-
-    def _build_log_section(self):
-        frame = self._build_section("📋 Console")
-        
-        self.log_box = scrolledtext.ScrolledText(frame, height=10, wrap="word",
-                                                 bg="#010409", fg="#7ee787",
-                                                 font=("Consolas", 9), relief="flat")
-        self.log_box.pack(fill="both", expand=True)
-        self.log_box.config(state="disabled")
+        ttk.Button(f, text="Enviar BRN", command=self._send_brn).grid(row=11, column=1, padx=10, pady=5)
 
     # ========================================================
-    # LOG
+    # ABA PONTE BTC — AQUI ACONTECE A MAGIA!
     # ========================================================
-    def log(self, message):
-        timestamp = time.strftime("%H:%M:%S")
-        self.log_box.config(state="normal")
-        self.log_box.insert("end", f"[{timestamp}] {message}\n")
-        self.log_box.see("end")
-        self.log_box.config(state="disabled")
+    
+    def _build_bridge_tab(self):
+        f = self.tab_bridge
+        
+        # ─── CONFIGURAÇÃO DA PONTE ───
+        frame_config = ttk.LabelFrame(f, text="  ⚙️ Configuração da Ponte  ")
+        frame_config.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Label(frame_config, text="Endereço BTC da Ponte:").grid(row=0, column=0, sticky=tk.W, padx=10, pady=8)
+        self.bridge_address_var = tk.StringVar()
+        ttk.Entry(frame_config, textvariable=self.bridge_address_var, width=55).grid(row=0, column=1, padx=5, pady=8)
+        ttk.Button(frame_config, text="Salvar", command=self._set_bridge_address).grid(row=0, column=2, padx=5, pady=8)
+        
+        # ─── DEPÓSITO: BTC → wBTC ───
+        frame_deposit = ttk.LabelFrame(f, text="  📥 Depósito: BTC → wBTC  ")
+        frame_deposit.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Label(frame_deposit, text="Seu endereço BTC:").grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
+        self.btc_from_var = tk.StringVar()
+        ttk.Entry(frame_deposit, textvariable=self.btc_from_var, width=55).grid(row=0, column=1, columnspan=2, padx=5, pady=5)
+        
+        ttk.Label(frame_deposit, text="Receber wBTC em:").grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
+        self.brn_to_var = tk.StringVar(value="brn1cd943fa71e1f91dcd62f52fc6138bc845ab")
+        ttk.Entry(frame_deposit, textvariable=self.brn_to_var, width=55).grid(row=1, column=1, columnspan=2, padx=5, pady=5)
+        
+        ttk.Label(frame_deposit, text="Valor em BTC:").grid(row=2, column=0, sticky=tk.W, padx=10, pady=5)
+        self.amount_btc_var = tk.StringVar()
+        ttk.Entry(frame_deposit, textvariable=self.amount_btc_var, width=30).grid(row=2, column=1, padx=5, pady=5)
+        ttk.Button(frame_deposit, text="Solicitar Depósito", command=self._create_deposit).grid(row=2, column=2, padx=5, pady=5)
+        
+        # Resultado do depósito
+        self.deposit_result = scrolledtext.ScrolledText(frame_deposit, height=5, width=75)
+        self.deposit_result.grid(row=3, column=0, columnspan=3, padx=10, pady=8)
+        
+        # Confirmar depósito
+        ttk.Separator(frame_deposit, orient=tk.HORIZONTAL).grid(row=4, column=0, columnspan=3, sticky=tk.EW, padx=10, pady=5)
+        ttk.Label(frame_deposit, text="✅ Já enviou? Confirme abaixo:").grid(row=5, column=0, columnspan=3, sticky=tk.W, padx=10, pady=5)
+        
+        ttk.Label(frame_deposit, text="ID Solicitação:").grid(row=6, column=0, sticky=tk.W, padx=10, pady=3)
+        self.deposit_req_id_var = tk.StringVar()
+        ttk.Entry(frame_deposit, textvariable=self.deposit_req_id_var, width=30).grid(row=6, column=1, padx=5, pady=3)
+        
+        ttk.Label(frame_deposit, text="TXID Transação BTC:").grid(row=7, column=0, sticky=tk.W, padx=10, pady=3)
+        self.btc_txid_var = tk.StringVar()
+        ttk.Entry(frame_deposit, textvariable=self.btc_txid_var, width=55).grid(row=7, column=1, columnspan=2, padx=5, pady=3)
+        
+        ttk.Button(frame_deposit, text="Verificar e Cunhar wBTC", command=self._confirm_deposit).grid(row=8, column=1, columnspan=2, padx=5, pady=8)
+        
+        # ─── SAQUE: wBTC → BTC ───
+        frame_withdraw = ttk.LabelFrame(f, text="  📤 Saque: wBTC → BTC  ")
+        frame_withdraw.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Label(frame_withdraw, text="Queimar wBTC da carteira:").grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
+        self.withdraw_wbtc_var = tk.StringVar()
+        ttk.Entry(frame_withdraw, textvariable=self.withdraw_wbtc_var, width=30).grid(row=0, column=1, padx=5, pady=5)
+        
+        ttk.Label(frame_withdraw, text="Receber BTC em:").grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
+        self.withdraw_btc_addr_var = tk.StringVar()
+        ttk.Entry(frame_withdraw, textvariable=self.withdraw_btc_addr_var, width=55).grid(row=1, column=1, columnspan=2, padx=5, pady=5)
+        
+        ttk.Button(frame_withdraw, text="Solicitar Saque", command=self._create_withdrawal).grid(row=2, column=1, padx=5, pady=8)
+        
+        self.withdraw_result = scrolledtext.ScrolledText(frame_withdraw, height=4, width=75)
+        self.withdraw_result.grid(row=3, column=0, columnspan=3, padx=10, pady=5)
 
     # ========================================================
-    # AÇÕES
+    # ABA TRANSAÇÕES E REDE
     # ========================================================
-    def refresh_p2p(self):
-        try:
-            status = self.api.get_network_status()
-            text = (
-                f"🔹 Peers conectados: {len(status['connected_peers'])}\n"
-                f"🔹 Peers conhecidos: {len(status['known_peers'])}\n"
-                f"🔹 Rede local: {status['local_endpoint']}\n"
-                f"🔹 Descobertos na LAN: {len(status['discovered_lan'])}"
-            )
-            self.p2p_status.config(state="normal")
-            self.p2p_status.delete("1.0", "end")
-            self.p2p_status.insert("1.0", text)
-            self.p2p_status.config(state="disabled")
-        except Exception as e:
-            self.log(f"❌ Erro ao atualizar rede: {e}")
+    
+    def _build_tx_tab(self):
+        f = self.tab_tx
+        self.tx_log = scrolledtext.ScrolledText(f, height=30, width=100)
+        self.tx_log.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+        self.tx_log.insert(tk.END, "Histórico de transações aparecerá aqui...\n")
+    
+    def _build_network_tab(self):
+        f = self.tab_network
+        self.network_info = scrolledtext.ScrolledText(f, height=30, width=100)
+        self.network_info.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+        self.network_info.insert(tk.END, "Informações da rede aparecerão aqui...\n")
 
-    def generate_wallet(self):
-        self.log("Gerando nova carteira…")
-        try:
-            kp = self.api.generate_wallet()
-            self.wallet["address"] = kp["address"]
-            self.wallet["sk"] = kp["spend_secret_key"]
-            self.wallet["pk"] = kp["public_key"]
-            
-            # Atualizar campos
-            self.addr_entry.config(state="normal")
-            self.addr_entry.delete(0, "end")
-            self.addr_entry.insert(0, kp["address"])
-            self.addr_entry.config(state="readonly")
-            
-            self.sk_entry.config(state="normal")
-            self.sk_entry.delete(0, "end")
-            self.sk_entry.insert(0, kp["spend_secret_key"])
-            self.sk_entry.config(state="readonly")
-            
-            self.pk_entry.config(state="normal")
-            self.pk_entry.delete(0, "end")
-            self.pk_entry.insert(0, kp["public_key"])
-            self.pk_entry.config(state="readonly")
-            
-            self.log(f"✅ Carteira criada: {kp['address'][:16]}…")
-            self.check_balance()
-        except Exception as e:
-            self.log(f"❌ Erro: {e}")
-
-    def check_balance(self):
-        if not self.wallet["address"]:
-            self.log("⚠️ Crie uma carteira primeiro.")
+    # ========================================================
+    # MÉTODOS DA PONTE BTC
+    # ========================================================
+    
+    def _set_bridge_address(self):
+        addr = self.bridge_address_var.get().strip()
+        if self.bridge:
+            result = self.bridge.set_bridge_address(addr)
+            messagebox.showinfo("Ponte BTC", result["message"])
+    
+    def _create_deposit(self):
+        if not self.bridge:
+            messagebox.showwarning("Aviso", "Ponte BTC não inicializada!")
             return
         
         try:
-            result = self.api.get_balance(self.wallet["address"])
-            self.balance_box.config(state="normal")
-            self.balance_box.delete("1.0", "end")
-            self.balance_box.insert("1.0", f"💰 Saldo: {result['balance']:.8f} BRN")
-            self.balance_box.config(state="disabled")
-            self.log("✅ Saldo atualizado.")
-        except Exception as e:
-            self.log(f"❌ Erro: {e}")
-
-    def export_wallet(self):
-        filename = self.filename_entry.get().strip()
-        password = self.password_entry.get()
-        
-        if not self.wallet["address"]:
-            self.log("⚠️ Crie uma carteira primeiro.")
+            btc_from = self.btc_from_var.get().strip()
+            brn_to = self.brn_to_var.get().strip()
+            amount = float(self.amount_btc_var.get().strip())
+            
+            result = self.bridge.create_deposit_request(btc_from, brn_to, amount)
+            
+            self.deposit_result.delete(1.0, tk.END)
+            if result["success"]:
+                self.deposit_result.insert(tk.END, f"✅ SOLICITAÇÃO CRIADA!\n\n")
+                self.deposit_result.insert(tk.END, f"ID: {result['request_id']}\n")
+                self.deposit_result.insert(tk.END, f"Endereço da Ponte:\n{result['bridge_address']}\n\n")
+                self.deposit_result.insert(tk.END, f"Valor: {result['expected_amount']:.8f} BTC\n")
+                self.deposit_result.insert(tk.END, f"Você recebe: {result['net_amount']:.8f} wBTC\n\n")
+                self.deposit_result.insert(tk.END, f"📋 INSTRUÇÕES:\n{result['instructions']}")
+                self.deposit_req_id_var.set(result["request_id"])
+            else:
+                self.deposit_result.insert(tk.END, f"❌ ERRO: {result['message']}")
+        except ValueError:
+            messagebox.showerror("Erro", "Digite um valor válido")
+    
+    def _confirm_deposit(self):
+        if not self.bridge:
             return
-        if len(password) < 12:
-            self.log("❌ Senha precisa de pelo menos 12 caracteres.")
+        
+        req_id = self.deposit_req_id_var.get().strip()
+        txid = self.btc_txid_var.get().strip()
+        operator_addr = "brn1cd943fa71e1f91dcd62f52fc6138bc845ab"  # Operador padrão
+        
+        if not req_id or not txid:
+            messagebox.showwarning("Aviso", "Preencha ID da solicitação e TXID")
             return
         
-        self.log("💾 Salvando carteira…")
-        messagebox.showinfo("Info", "Funcionalidade de backup disponível em breve!")
-
-    def import_wallet(self):
-        self.log("📂 Carregando carteira…")
-        messagebox.showinfo("Info", "Funcionalidade de backup disponível em breve!")
-
-    def send_transaction(self):
-        to = self.to_entry.get().strip()
-        amount_text = self.amount_entry.get()
+        result = self.bridge.confirm_deposit(req_id, txid, operator_addr)
         
-        if not self.wallet["address"]:
-            self.log("⚠️ Crie uma carteira primeiro.")
+        self.deposit_result.delete(1.0, tk.END)
+        if result["success"]:
+            self.deposit_result.insert(tk.END, f"✅ {result['message']}\n")
+            if "wbtc_minted" in result:
+                self.deposit_result.insert(tk.END, f"wBTC Cunhado: {result['wbtc_minted']:.8f}\n")
+                self.deposit_result.insert(tk.END, f"TXID BTC: {result['btc_txid']}\n")
+                self._refresh_stats()
+        else:
+            self.deposit_result.insert(tk.END, f"❌ {result['message']}")
+    
+    def _create_withdrawal(self):
+        if not self.bridge:
             return
         
         try:
-            amount = float(amount_text)
-            if amount <= 0:
-                raise ValueError()
-        except:
-            self.log("❌ Valor inválido.")
-            return
+            amount = float(self.withdraw_wbtc_var.get().strip())
+            btc_dest = self.withdraw_btc_addr_var.get().strip()
+            brn_sender = self.brn_to_var.get().strip()  # Usuário padrão
+            
+            result = self.bridge.create_withdrawal_request(brn_sender, btc_dest, amount)
+            
+            self.withdraw_result.delete(1.0, tk.END)
+            if result["success"]:
+                self.withdraw_result.insert(tk.END, f"✅ SOLICITAÇÃO CRIADA!\n\n")
+                self.withdraw_result.insert(tk.END, f"ID: {result['request_id']}\n")
+                self.withdraw_result.insert(tk.END, f"Queimado: {result['wbtc_burned']:.8f} wBTC\n")
+                self.withdraw_result.insert(tk.END, f"A receber: {result['btc_receive']:.8f} BTC\n\n")
+                self.withdraw_result.insert(tk.END, f"📋 PRÓXIMO PASSO:\n{result['next_step']}")
+                self._refresh_stats()
+            else:
+                self.withdraw_result.insert(tk.END, f"❌ ERRO: {result['message']}")
+        except ValueError:
+            messagebox.showerror("Erro", "Digite um valor válido")
+    
+    def _send_brn(self):
+        messagebox.showinfo("Em Desenvolvimento", "Transação BRN básica — conecte com sua API!")
+    
+    def _refresh_stats(self):
+        """Atualiza saldos e informações"""
+        if self.bridge:
+            addr = self.brn_to_var.get().strip()
+            wbtc_info = self.bridge.get_wbtc_balance(addr)
+            self.wbtc_var.set(f"{wbtc_info['balance']:.8f} wBTC")
         
-        if not to.startswith("brn1") or len(to) != 44:
-            self.log("❌ Endereço inválido.")
-            return
-        
-        self.log(f"Enviando {amount} BRN para {to[:16]}…")
-        
-        def do_send():
-            try:
-                result = self.api.send_funds(
-                    self.wallet["address"], to, amount,
-                    self.wallet["sk"], self.wallet["pk"]
-                )
-                self.log(f"✅ {result['message']}")
-                self.check_balance()
-            except Exception as e:
-                self.log(f"❌ Erro: {e}")
-        
-        threading.Thread(target=do_send, daemon=True).start()
-
-    def toggle_mining(self):
-        if not self.wallet["address"]:
-            self.log("⚠️ Crie uma carteira primeiro.")
-            return
-        
-        def do_toggle():
-            try:
-                result = self.api.toggle_mining(self.wallet["address"])
-                self.mining = result["mining"]
-                
-                if self.mining:
-                    self.mining_btn.config(text="🛑 Parar Mineração")
-                    self.mining_status.config(text="Minerando…", foreground="#3fb950")
-                else:
-                    self.mining_btn.config(text="▶ Iniciar Mineração")
-                    self.mining_status.config(text="Parada", foreground="#f85149")
-                
-                self.log(f"✅ {result['message']}")
-            except Exception as e:
-                self.log(f"❌ Erro: {e}")
-        
-        threading.Thread(target=do_toggle, daemon=True).start()
-
-    # ========================================================
-    # ATUALIZAÇÃO AUTOMÁTICA
-    # ========================================================
-    def _start_auto_refresh(self):
-        def refresh_loop():
-            while self.auto_refresh_running:
-                try:
-                    # Atualizar status da mineração
-                    chain_info = self.api.get_full_chain()
-                    if chain_info["is_mining"] != self.mining:
-                        self.mining = chain_info["is_mining"]
-                        if self.mining:
-                            self.mining_btn.config(text="🛑 Parar Mineração")
-                            self.mining_status.config(text="Minerando…", foreground="#3fb950")
-                        else:
-                            self.mining_btn.config(text="▶ Iniciar Mineração")
-                            self.mining_status.config(text="Parada", foreground="#f85149")
-                except:
-                    pass
-                time.sleep(5)
-        
-        threading.Thread(target=refresh_loop, daemon=True).start()
-
+        self.status_label.config(text=f"✅ Online | Ponte BTC ativa")
+        self.root.after(3000, self._refresh_stats)
+    
     def run(self):
-        try:
-            self.root.mainloop()
-        finally:
-            self.auto_refresh_running = False
-
-
-# ============================================================
-# INTEGRAÇÃO COM O BRUNO_COIN
-# ============================================================
-
-def start_gui(api):
-    gui = BrunoGUI(api)
-    gui.run()
+        self.root.mainloop()
