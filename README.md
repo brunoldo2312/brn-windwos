@@ -1,3 +1,813 @@
+📘 Manual do Código — BRN P2P
+
+Versão: 1.0
+Última atualização: 2026
+Stack: Solidity + Python (aiohttp) + JavaScript (Ethers.js v5) + WebSocket + ngrok
+
+---
+
+📑 Índice
+
+1. Visão Geral
+2. Arquitetura do Sistema
+3. Estrutura de Arquivos
+4. Fluxo de Dados
+5. Módulo 1 — Contrato Inteligente
+6. Módulo 2 — Servidor Python
+7. Módulo 3 — Interface HTML
+8. Módulo 4 — Cliente JavaScript
+9. Módulo 5 — Túnel ngrok
+10. Configuração e Deploy
+11. Protocolo WebSocket
+12. Erros Comuns e Soluções
+13. Segurança
+14. Roadmap e Limitações
+
+---
+
+1. Visão Geral
+
+O BRN P2P é uma carteira descentralizada que permite troca peer-to-peer entre USDC (Polygon) e BRL (PIX/dinheiro) usando:
+
+· Assinaturas EIP-712 off-chain → o vendedor assina a ordem sem gastar gas.
+· Mural WebSocket → as ordens assinadas ficam públicas em memória no servidor.
+· Escrow on-chain → quando alguém compra, o contrato valida a assinatura e move os USDC.
+
+O que ele faz
+
+✅ Publicar ordem de venda de USDC com cotação em BRL
+✅ Exibir mural compartilhado em tempo real
+✅ Executar ordem on-chain com transferência de USDC
+✅ Cancelar ordem via nonce (invalida assinatura)
+
+O que ele não faz
+
+❌ Não processa pagamento em BRL (isso é combinado entre as partes)
+❌ Não custodia BRL
+❌ Não faz matching automático
+
+---
+
+2. Arquitetura do Sistema
+
+```
+┌──────────────────┐         WebSocket          ┌──────────────────┐
+│                  │ ◄────────────────────────► │                  │
+│   NAVEGADOR      │      HTTP (index/app)      │   server.py      │
+│  index.html      │ ◄────────────────────────► │   (aiohttp)      │
+│  app.js          │                            │                  │
+│  ethers.js       │                            │  MURAL (RAM)     │
+└────────┬─────────┘                            └────────┬─────────┘
+         │                                               │
+         │ assina EIP-712                                │ ngrok
+         │                                               ▼
+         ▼                                       ┌──────────────────┐
+┌──────────────────────┐                         │  Internet        │
+│  MetaMask            │                         │  (URL pública)   │
+│  (chave privada)     │                         └──────────────────┘
+└────────┬─────────────┘
+         │
+         │ tx on-chain
+         ▼
+┌──────────────────────┐
+│ EscrowP2POffChain    │  ← Polygon Mainnet
+│ (Solidity)           │
+└──────────────────────┘
+```
+
+Camadas
+
+Camada Responsabilidade Onde roda
+Apresentação UI, formulários, mural Navegador
+Assinatura Chave privada, EIP-712 MetaMask (extensão)
+Mural Broadcast de ordens server.py
+Execução Transferência USDC Contrato na Polygon
+
+---
+
+3. Estrutura de Arquivos
+
+```
+brn-p2p/
+│
+├── contracts/
+│   └── EscrowP2POffChain.sol    ← Contrato Solidity
+│
+├── server.py                    ← Servidor aiohttp (HTTP + WS)
+├── ngrok_tunnel.py              ← Wrapper do pyngrok
+│
+├── index.html                   ← Interface visual
+├── app.js                       ← Lógica Web3 + WS
+│
+├── requirements.txt             ← Dependências Python
+├── ngrok_token.txt              ← Seu token ngrok (secreto)
+├── ngrok_domain.txt             ← Domínio fixo ngrok
+│
+└── README.md                    ← Guia rápido
+```
+
+Matriz de dependências
+
+```
+index.html ──── carrega ──► ethers.js (CDN)
+     │
+     └── carrega ──► app.js ──► MetaMask ──► Polygon
+                      │
+                      └── conecta ──► server.py ──► ngrok ──► Internet
+```
+
+---
+
+4. Fluxo de Dados
+
+4.1 Criar ordem (vendedor)
+
+```
+[Vendedor preenche form]
+        │
+        ▼
+[app.js: paraWei(valorUSDC), paraWei(cotacao)]
+        │
+        ▼
+[MetaMask: eth_requestAccounts]  → endereço
+        │
+        ▼
+[ERC20.approve(contrato, MAX_UINT)]  → tx  (gas)
+        │
+        ▼
+[ethers._signTypedData(domain, types, value)]  → assinatura (sem gas)
+        │
+        ▼
+[WebSocket: publicar_ordem]
+        │
+        ▼
+[server.py: valida → MURAL[hash] = ordem]
+        │
+        ▼
+[broadcast para todos os clientes WS]
+```
+
+4.2 Executar ordem (comprador)
+
+```
+[Comprador clica "Comprar"]
+        │
+        ▼
+[app.js: confirma → contrato.executarOrdem(struct, assinatura, comprador)]
+        │
+        ▼
+[Contrato Solidity:
+   1. checa expiração
+   2. checa nonce não usada
+   3. recupera signer via ecrecover
+   4. valida signer == criador
+   5. marca nonce como usada
+   6. transferFrom(criador → comprador, valor - taxa)
+   7. transferFrom(criador → admin, taxa)
+        ]
+        │
+        ▼
+[WebSocket: ordem_executada → remove do mural]
+```
+
+4.3 Cancelar ordem
+
+```
+[Vendedor clica "Cancelar"]
+        │
+        ▼
+[contrato.cancelarOrdemOffChain(nonce)]
+        │
+        ▼
+[nonceUtilizado[criador][nonce] = true]  → assinatura morre
+        │
+        ▼
+[WebSocket: cancelar_ordem → remove do mural]
+```
+
+---
+
+5. Módulo 1 — Contrato Inteligente
+
+Arquivo: contracts/EscrowP2POffChain.sol
+Linguagem: Solidity ^0.8.20
+Rede-alvo: Polygon Mainnet (chainId 137)
+
+5.1 Estado
+
+```solidity
+address public admin;              // recebe a taxa
+IERC20 public usdcToken;           // token aceito
+uint256 public taxaAplicacao;      // 100 = 1%
+bytes32 public DOMAIN_SEPARATOR;   // EIP-712
+mapping(address => mapping(uint256 => bool)) public nonceUtilizado;
+```
+
+5.2 Struct Ordem
+
+```solidity
+struct Ordem {
+    address payable criador;    // quem assinou
+    uint256 valorUSDC;          // em wei (6 decimais)
+    uint256 cotacao;            // BRL por USDC * 1e8
+    uint256 nonce;              // único por criador
+    uint256 expiracao;          // timestamp unix
+}
+```
+
+⚠️ Atenção: valorUSDC NÃO é o total em BRL. É a quantidade de USDC que o vendedor está oferecendo. O preço em BRL fica em cotacao.
+
+5.3 Função getSigner
+
+Recupera o endereço que assinou a ordem:
+
+```solidity
+bytes32 structHash = keccak256(abi.encode(
+    ORDEM_TYPEHASH, criador, valorUSDC, cotacao, nonce, expiracao
+));
+bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+return recoverSigner(digest, assinatura);
+```
+
+Deve produzir exatamente o mesmo hash que ethers._TypedDataEncoder.hash() no JS.
+
+5.4 Função executarOrdem
+
+Ordem de operações crítica:
+
+1. require(block.timestamp <= expiracao) — ordem ainda válida
+2. require(!nonceUtilizado[criador][nonce]) — não foi gasta
+3. require(getSigner == criador) — assinatura legítima
+4. nonceUtilizado[criador][nonce] = true — antes do transfer (padrão checks-effects-interactions)
+5. transferFrom(criador → comprador, valor - taxa)
+6. transferFrom(criador → admin, taxa)
+
+5.5 Função cancelarOrdemOffChain
+
+```solidity
+nonceUtilizado[msg.sender][_nonce] = true;
+```
+
+Não devolve nada — só invalida. O vendedor mantém os USDC (nunca saíram da carteira dele).
+
+5.6 recoverSigner
+
+Assembly que extrai r, s, v dos 65 bytes da assinatura e chama ecrecover.
+
+⚠️ Vulnerabilidade conhecida: não valida se s está na metade inferior da curva (EIP-2). Para produção séria, considere usar OpenZeppelin ECDSA.recover.
+
+---
+
+6. Módulo 2 — Servidor Python
+
+Arquivo: server.py
+Framework: aiohttp
+Porta padrão: 8080
+
+6.1 Responsabilidades
+
+Componente Função
+HTTP Serve index.html, app.js, /api/mural, /health
+WebSocket Broadcast de ordens em tempo real (/ws)
+CORS Permite origens externas (ngrok, mobile)
+Rate limit Máx. 60 msgs / 10s por IP
+Limpeza Remove ordens expiradas a cada 60s
+Startup Inicia túnel ngrok se token disponível
+
+6.2 Estado em memória
+
+```python
+MURAL: dict = {}         # hash -> ordem
+CLIENTES_WS: set = set() # WebSockets conectados
+LOCK = asyncio.Lock()    # protege acesso concorrente
+RATE_LIMIT: dict = {}    # IP -> [timestamps]
+TUNEL = None             # NgrokTunnel global
+```
+
+⚠️ Tudo se perde ao reiniciar. Para produção, troque por Redis.
+
+6.3 Rotas
+
+Método Rota Handler Descrição
+GET / index_handler Serve index.html
+GET /index.html index_handler Alias
+GET /app.js app_js_handler Serve JS com MIME correto
+GET /api/mural mural_rest_handler Lista ordens ativas (JSON)
+GET /health health_handler Status + URL ngrok
+GET /ws ws_handler Upgrade para WebSocket
+
+6.4 Validação de ordem (validar_ordem)
+
+```python
+CAMPOS_OBRIGATORIOS = [
+    "hash", "criador", "contratoAddress",
+    "valorOferecido", "valorDesejado", "expiracao",
+]
+```
+
+Checa:
+
+· Todos os campos presentes e não vazios
+· contratoAddress começa com 0x e tem 42 chars
+· expiracao no futuro
+· valorOferecido e valorDesejado positivos
+
+6.5 Rate limit
+
+```python
+RATE_JANELA = 10    # segundos
+RATE_MAX = 60       # msgs por janela
+```
+
+Chave: request.remote (IP). Se exceder, devolve erro via WS.
+
+6.6 Broadcast
+
+```python
+async def broadcast(mensagem: dict):
+    payload = json.dumps(mensagem)
+    for ws in CLIENTES_WS:
+        await ws.send_str(payload)
+```
+
+Clientes mortos são removidos automaticamente.
+
+6.7 Descoberta de arquivos (PyInstaller-ready)
+
+```python
+if getattr(sys, "frozen", False):
+    DIR = sys._MEIPASS                    # bundle interno
+else:
+    DIR = os.path.dirname(os.path.abspath(__file__))
+```
+
+E para .txt:
+
+```python
+def _pasta_config():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)  # ao lado do .exe
+    return os.path.dirname(os.path.abspath(__file__))
+```
+
+6.8 Task de limpeza
+
+Roda a cada 60s, remove ordens expiradas do MURAL e emite ordem_expirada.
+
+6.9 Ciclo de vida
+
+· iniciar_tasks — cria task de limpeza + tenta subir ngrok
+· parar_tasks — cancela task + fecha túnel
+
+Prioridade do token ngrok:
+
+1. os.environ["NGROK_TOKEN"]
+2. arquivo ngrok_token.txt
+
+---
+
+7. Módulo 3 — Interface HTML
+
+Arquivo: index.html
+Estilo: Dark theme (#0f172a), responsivo
+
+7.1 Blocos principais
+
+Bloco ID Conteúdo
+Header endereco-carteira, btn-conectar Conexão MetaMask
+Mensagem mensagem Feedback (erro/ok/aviso)
+Aba Criar tab-criar Form de nova ordem
+Aba Minhas tab-minhas Ordens do usuário
+Mural lista-ordens Tabela P2P
+Stats stat-total, stat-saldo-usdc Contadores
+Status bar ws-dot, ws-status Conexão WS
+
+7.2 Campos do formulário
+
+ID Tipo Descrição
+venda-usdc number (6 casas) USDC a vender
+venda-cotacao number (2 casas) BRL por USDC
+venda-expiracao select 15m / 30m / 1h / 6h / 24h
+total-estimado div Calculado em tempo real
+
+7.3 CDN obrigatório
+
+```html
+<script src="https://cdn.ethers.io/lib/ethers-5.7.2.umd.min.js"></script>
+<script src="app.js"></script>
+```
+
+⚠️ A ordem importa. app.js depende de ethers global.
+
+---
+
+8. Módulo 4 — Cliente JavaScript
+
+Arquivo: app.js
+Biblioteca: Ethers.js v5
+Padrão: IIFE com funções globais expostas via window
+
+8.1 CONFIG (topo do arquivo)
+
+```js
+const CONFIG = {
+  CONTRACT_ADDRESS: "0x0000...",   // ← OBRIGATÓRIO preencher
+  CHAIN_ID: 137,                    // Polygon Mainnet
+  USDC_ADDRESS: "0x2791Bca...",    // USDC nativo Polygon
+  DEC_USDC: 6,                      // USDC tem 6 casas
+  DEC_COTACAO: 8,                   // cotação armazenada com 8
+  EXPLORER: "https://polygonscan.com",
+};
+```
+
+8.2 Estado global
+
+```js
+let provider, signer, endereco, contrato, usdcContrato;
+let ws, wsReconnectTimer;
+let ordensMural = {};     // hash -> ordem
+```
+
+8.3 Utilitários numéricos
+
+```js
+// "1.23" + 6 decimais → BigNumber (sem erro de float)
+function paraWei(str, decimals) { ... }
+
+// BigNumber → string pt-BR formatada
+function deWei(big, decimals, casas = 6) { ... }
+```
+
+🔑 Regra de ouro: nunca use Number() * 1e6. Sempre string → BigNumber.
+
+8.4 Funções principais
+
+Função Gatilho Ação
+init() DOMContentLoaded Configura provider, listeners, WS
+conectar() clique eth_requestAccounts + valida rede
+atualizarSaldo() pós-conexão Lê balanceOf USDC
+criarOrdem() clique Assina EIP-712 + publica no WS
+executarOrdem(hash) clique Tx executarOrdem no contrato
+cancelarOrdem(hash) clique Tx cancelarOrdemOffChain
+renderizarMural() 1s + eventos WS Desenha tabela
+renderizarMinhas() idem Aba "Minhas"
+conectarWS() init Abre /ws com retry
+
+8.5 Assinatura EIP-712 (coração do sistema)
+
+```js
+const domain = {
+  name: "CarteiraBRN_P2P",
+  version: "1",
+  chainId: CONFIG.CHAIN_ID,
+  verifyingContract: CONFIG.CONTRACT_ADDRESS,
+};
+const types = {
+  Ordem: [
+    { name: "criador",    type: "address" },
+    { name: "valorUSDC",  type: "uint256" },
+    { name: "cotacao",    type: "uint256" },
+    { name: "nonce",      type: "uint256" },
+    { name: "expiracao",  type: "uint256" },
+  ],
+};
+const assinatura = await signer._signTypedData(domain, types, value);
+```
+
+O domain precisa ser idêntico ao constructor do Solidity:
+
+Solidity JavaScript
+keccak256("CarteiraBRN_P2P") name: "CarteiraBRN_P2P"
+keccak256("1") version: "1"
+block.chainid chainId: 137
+address(this) verifyingContract: CONFIG.CONTRACT_ADDRESS
+
+Se um só divergir → ecrecover retorna endereço errado → "Assinatura invalida".
+
+8.6 Nonce
+
+```js
+nonce = Math.floor(Date.now() / 1000) * 1000 + Math.floor(Math.random() * 1000);
+```
+
+Combinação timestamp(ms) + aleatório(0-999). Na prática, evita colisão sem precisar de coordenação.
+
+8.7 WebSocket
+
+```js
+ws.onmessage = (ev) => {
+  const msg = JSON.parse(ev.data);
+  switch (msg.tipo) {
+    case "snapshot":         // lista inicial
+    case "nova_ordem":       // ordem nova publicada
+    case "ordem_cancelada":  // vendedor cancelou
+    case "ordem_executada":  // comprador executou
+    case "ordem_expirada":   // expirou no servidor
+    case "erro":             // servidor rejeitou algo
+  }
+};
+```
+
+Reconexão automática a cada 3s se cair.
+
+---
+
+9. Módulo 5 — Túnel ngrok
+
+Arquivo: ngrok_tunnel.py
+
+9.1 Uso
+
+```python
+from ngrok_tunnel import NgrokTunnel
+
+tunel = NgrokTunnel(
+    token="seu_token",
+    target="http://localhost:8080",
+    domain="seventy-rigging-ploy.ngrok-free.dev",
+)
+url = tunel.start()   # retorna https://...
+tunel.close()         # mata o processo ngrok
+```
+
+9.2 Detalhes importantes
+
+· Faz ngrok.kill() no início → limpa configs anteriores
+· Usa schemes=["https"] → só expõe HTTPS
+· Se domain foi passado, usa domínio fixo (plano gratuito não permite)
+· Guarda public_url para consulta posterior (usado em /health)
+
+---
+
+10. Configuração e Deploy
+
+10.1 Checklist pré-deploy
+
+```
+[ ] Deploy do contrato EscrowP2POffChain na Polygon
+[ ] Copiar endereço do contrato
+[ ] Colar em app.js → CONFIG.CONTRACT_ADDRESS
+[ ] Colar token em ngrok_token.txt
+[ ] Domínio ngrok em ngrok_domain.txt
+[ ] pip install -r requirements.txt
+[ ] python server.py
+[ ] Abrir http://localhost:8080 ou URL do ngrok
+```
+
+10.2 Parâmetros do contrato no Remix
+
+Parâmetro Valor
+_usdcToken 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+_admin seu endereço (recebe taxa)
+Compiler 0.8.20+
+EVM Version paris (ou shanghai)
+Rede Polygon Mainnet (Injected Provider)
+
+10.3 Variáveis de ambiente
+
+Nome Descrição
+NGROK_TOKEN Sobrescreve arquivo
+NGROK_DOMAIN Sobrescreve arquivo
+PORT Porta do servidor (default 8080)
+
+10.4 Rodando como .exe (PyInstaller)
+
+```bash
+pyinstaller --onefile --add-data "index.html;." --add-data "app.js;." server.py
+```
+
+Os .txt (token, domínio) devem ficar ao lado do .exe, não dentro.
+
+---
+
+11. Protocolo WebSocket
+
+11.1 Mensagens do cliente → servidor
+
+tipo Payload Ação do servidor
+publicar_ordem {ordem} Valida e adiciona ao mural
+cancelar_ordem {hash} Remove do mural
+ordem_executada {hash, txHash} Remove do mural
+pedir_snapshot — Envia snapshot atual
+ping — Responde pong
+
+11.2 Mensagens do servidor → cliente
+
+tipo Payload Quando
+snapshot {ordens: [...]} Ao conectar ou quando pedido
+nova_ordem {ordem} Alguém publicou
+ordem_cancelada {hash} Vendedor cancelou
+ordem_executada {hash, txHash} Comprador executou
+ordem_expirada {hash} Task de limpeza removeu
+pong {ts} Resposta a ping
+erro {msg} Validação falhou
+
+11.3 Formato da ordem
+
+```json
+{
+  "hash": "0xabc...",              // digest EIP-712
+  "criador": "0x123...",
+  "contratoAddress": "0xdef...",
+  "valorOferecido": "100000000",   // USDC em wei (string)
+  "valorDesejado": "525000000",    // cotação * 1e8 (string)
+  "valorUSDC": "100000000",
+  "cotacao": "525000000",
+  "nonce": "1729000123456",
+  "expiracao": 1729001234,
+  "assinatura": "0x1234...",       // 65 bytes
+  "chainId": 137
+}
+```
+
+---
+
+12. Erros Comuns e Soluções
+
+12.1 "Assinatura invalida" (contrato)
+
+Causa: mismatch entre domain do JS e DOMAIN_SEPARATOR do Solidity.
+
+Solução:
+
+· Confirme name = "CarteiraBRN_P2P" (exato, com underscore)
+· Confirme version = "1"
+· Confirme chainId = 137
+· Confirme verifyingContract = endereço do contrato
+
+12.2 "Sem conexão com o servidor"
+
+Causa: WS caiu ou URL errada.
+
+Solução:
+
+· Abrir DevTools → Network → WS
+· Verificar se /ws retorna 101 (Upgrade)
+· Verificar firewall/CORS
+
+12.3 "Saldo USDC insuficiente"
+
+Causa: carteira sem USDC na Polygon.
+
+Solução: comprar USDC (Binance → Polygon) ou trocar MATIC.
+
+12.4 MetaMask não abre
+
+Causa: sem window.ethereum.
+
+Solução: instalar extensão + recarregar página.
+
+12.5 Rede errada
+
+Causa: MetaMask em outra rede (Ethereum, BSC...).
+
+Solução: trocar para Polygon Mainnet (chainId 137). O app.js avisa.
+
+12.6 ngrok com erro 401
+
+Causa: token inválido/expirado.
+
+Solução: renovar em https://dashboard.ngrok.com/get-started/your-authtoken.
+
+12.7 "nonceUtilizado" = true inesperadamente
+
+Causa: nonce colidiu (raro) ou ordem já foi cancelada.
+
+Solução: criar nova ordem (novo nonce).
+
+12.8 Broadcast para 0 clientes
+
+Causa: todos os WS desconectaram.
+
+Solução: verificar /health → clientes_ws.
+
+12.9 Math.floor(x * 1e6) com erro
+
+Causa: float impreciso (0.1 * 1e6 = 99999.99...).
+
+Solução: sempre usar paraWei(str, decimals) → BigNumber.
+
+---
+
+13. Segurança
+
+13.1 Pontos fortes
+
+· ✅ Chave privada nunca sai da MetaMask
+· ✅ Assinatura off-chain → sem gas para publicar
+· ✅ Nonce + expiração → replay protection
+· ✅ nonceUtilizado marcado antes do transfer
+· ✅ Rate limit por IP
+
+13.2 Pontos de atenção
+
+Risco Impacto Mitigação
+Mural em memória Perde tudo ao reiniciar Trocar por Redis
+ecrecover sem validação de s Malleability Usar OpenZeppelin ECDSA
+Sem verificação de chainId no cliente WS Ordem de outra rede Assinar chainId no digest
+Broadcast sem assinatura Ordem forjada no mural Assinar payload WS
+CORS * Qualquer site pode conectar Restringir origens
+Sem HTTPS local Sniffing em rede Sempre ngrok/HTTPS
+
+13.3 Antes de mainnet com valores reais
+
+```
+[ ] Auditar contrato (Code4rena, Hacken, etc.)
+[ ] Usar OpenZeppelin ECDSA + ReentrancyGuard
+[ ] Persistir mural em Redis/Postgres
+[ ] Adicionar assinatura HMAC nas mensagens WS
+[ ] Restringir CORS a domínios conhecidos
+[ ] Adicionar rate limit por endereço Ethereum (não só IP)
+[ ] Logs estruturados + alertas
+[ ] Testes unitários (Hardhat + Foundry)
+[ ] Testes de integração (Playwright)
+[ ] Monitoramento (Sentry, Datadog)
+```
+
+---
+
+14. Roadmap e Limitações
+
+14.1 Limitações atuais
+
+· Mural em memória (volátil)
+· Sem matching automático
+· Sem custódia de BRL
+· Sem KYC/AML
+· Sem suporte a outros tokens além de USDC
+· Cotação é informativa — pagamento em BRL é manual
+
+14.2 Próximas features sugeridas
+
+# Feature Complexidade
+1 Persistência em SQLite Baixa
+2 Redis + Pub/Sub (multi-instância) Média
+3 Suporte a USDT, DAI Baixa
+4 Webhooks para PIX (Gerencianet) Alta
+5 Chat embutido vendedor↔comprador Média
+6 Sistema de reputação on-chain Alta
+7 Disputa com árbitro Alta
+8 App mobile (React Native) Alta
+9 Auditoria + bug bounty Alta
+10 Deploy em Kubernetes Média
+
+14.3 Roadmap sugerido
+
+```
+v1.0 ──► MVP atual (mural + EIP-712 + escrow)
+v1.1 ──► Persistência SQLite + testes
+v1.2 ──► Redis + múltiplas instâncias
+v1.3 ──► Webhooks PIX automáticos
+v2.0 ──► Reputação + disputas
+v3.0 ──► App mobile nativo
+```
+
+---
+
+📎 Apêndices
+
+A. Glossário
+
+Termo Significado
+EIP-712 Padrão de assinatura tipada do Ethereum
+Nonce Número único por criador; evita replay
+Escrow Contrato que custodia valor até condição
+Domain separator Hash do domínio EIP-712 (chain + contrato)
+Mural Lista pública de ordens (off-chain)
+Broadcast Enviar mensagem para todos os WS
+
+B. Comandos úteis
+
+```bash
+# Instalar
+pip install -r requirements.txt
+
+# Rodar
+python server.py
+
+# Ver logs WS
+tail -f /var/log/brn-p2p.log
+
+# Matar ngrok preso
+pkill ngrok
+
+# Testar WS manualmente
+wscat -c ws://localhost:8080/ws
+```
+
+C. Links úteis
+
+· Polygon RPC: https://polygon-rpc.com
+· PolygonScan: https://polygonscan.com
+· USDC Polygon: https://polygonscan.com/token/0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+· Remix IDE: https://remix.ethereum.org
+· Ethers v5 docs: https://docs.ethers.io/v5/
+· EIP-712: https://eips.ethereum.org/EIPS/eip-712
+· ngrok dashboard: https://dashboard.ngrok.com
+
+---
+
+Fim do manual. Para dúvidas específicas de código, consulte os comentários inline nos arquivos. Para arquitetura de alto nível, este documento é a fonte de verdade.
 # 1. dependências
 pip install pywebview cryptography argon2-cffi bitcoinlib
 # opcional:
